@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 
+	"kafka-notify/pkg/middleware"
 	"kafka-notify/pkg/models"
 
 	"github.com/IBM/sarama"
-	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -22,18 +23,20 @@ const (
 	KafkaServerAddress = "localhost:9092"
 )
 
-// ============== HELPER FUNCTIONS ==============
 var ErrNoMessagesFound = errors.New("no messages found")
 
-func getUserIDFromRequest(ctx *gin.Context) (string, error) {
-	userID := ctx.Param("userID")
+func getUserIDFromRequest(r *http.Request) (string, error) {
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 3 {
+		return "", ErrNoMessagesFound
+	}
+	userID := parts[2]
 	if userID == "" {
 		return "", ErrNoMessagesFound
 	}
 	return userID, nil
 }
 
-// ====== NOTIFICATION STORAGE ======
 type UserNotifications map[string][]models.Notification
 
 type NotificationStore struct {
@@ -54,7 +57,6 @@ func (ns *NotificationStore) Get(userID string) []models.Notification {
 	return ns.data[userID]
 }
 
-// ============== KAFKA RELATED FUNCTIONS ==============
 type Consumer struct {
 	store *NotificationStore
 }
@@ -112,24 +114,29 @@ func setupConsumerGroup(ctx context.Context, store *NotificationStore) {
 	}
 }
 
-func handleNotifications(ctx *gin.Context, store *NotificationStore) {
-	userID, err := getUserIDFromRequest(ctx)
+func handleNotifications(w http.ResponseWriter, r *http.Request, store *NotificationStore) {
+	userID, err := getUserIDFromRequest(r)
 	if err != nil {
-		ctx.JSON(http.StatusNotFound, gin.H{"message": err.Error()})
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 
 	notes := store.Get(userID)
+	w.Header().Set("Content-Type", "application/json")
+
 	if len(notes) == 0 {
-		ctx.JSON(http.StatusOK,
-			gin.H{
-				"message":       "No notifications found for user",
-				"notifications": []models.Notification{},
-			})
+		response := map[string]interface{}{
+			"message":       "No notifications found for user",
+			"notifications": []models.Notification{},
+		}
+		json.NewEncoder(w).Encode(response)
 		return
 	}
 
-	ctx.JSON(http.StatusOK, gin.H{"notifications": notes})
+	response := map[string]interface{}{
+		"notifications": notes,
+	}
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
@@ -141,16 +148,15 @@ func main() {
 	go setupConsumerGroup(ctx, store)
 	defer cancel()
 
-	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
-	router.GET("/notifications/:userID", func(ctx *gin.Context) {
-		handleNotifications(ctx, store)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/notifications/", func(w http.ResponseWriter, r *http.Request) {
+		handleNotifications(w, r, store)
 	})
 
-	fmt.Printf("Kafka CONSUMER (Group: %s) 👥📥 "+
-		"started at http://localhost%s\n", ConsumerGroup, ConsumerPort)
+	fmt.Printf("Kafka CONSUMER (Group: %s) 👥📥 started at http://localhost%s\n",
+		ConsumerGroup, ConsumerPort)
 
-	if err := router.Run(ConsumerPort); err != nil {
+	if err := http.ListenAndServe(ConsumerPort, middleware.Logger(mux)); err != nil {
 		log.Printf("failed to run the server: %v", err)
 	}
 }

@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"strconv"
 
+	"kafka-notify/pkg/middleware"
 	"kafka-notify/pkg/models"
 
 	"github.com/IBM/sarama"
-	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -20,7 +20,6 @@ const (
 	KafkaTopic         = "notifications"
 )
 
-// ============== HELPER FUNCTIONS ==============
 var ErrUserNotFoundInProducer = errors.New("user not found")
 
 func findUserByID(id int, users []models.User) (models.User, error) {
@@ -32,19 +31,20 @@ func findUserByID(id int, users []models.User) (models.User, error) {
 	return models.User{}, ErrUserNotFoundInProducer
 }
 
-func getIDFromRequest(formValue string, ctx *gin.Context) (int, error) {
-	id, err := strconv.Atoi(ctx.PostForm(formValue))
+func getIDFromRequest(r *http.Request, formValue string) (int, error) {
+	if err := r.ParseForm(); err != nil {
+		return 0, fmt.Errorf("failed to parse form: %w", err)
+	}
+	id, err := strconv.Atoi(r.FormValue(formValue))
 	if err != nil {
-		return 0, fmt.Errorf(
-			"failed to parse ID from form value %s: %w", formValue, err)
+		return 0, fmt.Errorf("failed to parse ID from form value %s: %w", formValue, err)
 	}
 	return id, nil
 }
 
-// ============== KAFKA RELATED FUNCTIONS ==============
 func sendKafkaMessage(producer sarama.SyncProducer,
-	users []models.User, ctx *gin.Context, fromID, toID int) error {
-	message := ctx.PostForm("message")
+	users []models.User, r *http.Request, fromID, toID int) error {
+	message := r.FormValue("message")
 
 	fromUser, err := findUserByID(fromID, users)
 	if err != nil {
@@ -57,8 +57,9 @@ func sendKafkaMessage(producer sarama.SyncProducer,
 	}
 
 	notification := models.Notification{
-		From: fromUser,
-		To:   toUser, Message: message,
+		From:    fromUser,
+		To:      toUser,
+		Message: message,
 	}
 
 	notificationJSON, err := json.Marshal(notification)
@@ -76,36 +77,37 @@ func sendKafkaMessage(producer sarama.SyncProducer,
 	return err
 }
 
-func sendMessageHandler(producer sarama.SyncProducer,
-	users []models.User) gin.HandlerFunc {
-	return func(ctx *gin.Context) {
-		fromID, err := getIDFromRequest("fromID", ctx)
-		if err != nil {
-			ctx.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+func sendMessageHandler(producer sarama.SyncProducer, users []models.User) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		toID, err := getIDFromRequest("toID", ctx)
+		fromID, err := getIDFromRequest(r, "fromID")
 		if err != nil {
-			ctx.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		err = sendKafkaMessage(producer, users, ctx, fromID, toID)
-		if errors.Is(err, ErrUserNotFoundInProducer) {
-			ctx.JSON(http.StatusNotFound, gin.H{"message": "User not found"})
-			return
-		}
+		toID, err := getIDFromRequest(r, "toID")
 		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{
-				"message": err.Error(),
-			})
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		ctx.JSON(http.StatusOK, gin.H{
-			"message": "Notification sent successfully!",
-		})
+		if err := sendKafkaMessage(producer, users, r, fromID, toID); err != nil {
+			if errors.Is(err, ErrUserNotFoundInProducer) {
+				http.Error(w, "User not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		response := map[string]string{"message": "Notification sent successfully!"}
+		json.NewEncoder(w).Encode(response)
 	}
 }
 
@@ -134,14 +136,12 @@ func main() {
 	}
 	defer producer.Close()
 
-	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
-	router.POST("/send", sendMessageHandler(producer, users))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/send", sendMessageHandler(producer, users))
 
-	fmt.Printf("Kafka PRODUCER 📨 started at http://localhost%s\n",
-		ProducerPort)
+	fmt.Printf("Kafka PRODUCER 📨 started at http://localhost%s\n", ProducerPort)
 
-	if err := router.Run(ProducerPort); err != nil {
+	if err := http.ListenAndServe(ProducerPort, middleware.Logger(mux)); err != nil {
 		log.Printf("failed to run the server: %v", err)
 	}
 }
